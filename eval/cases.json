@@ -1,0 +1,14 @@
+[
+  {
+    "name": "Capex funding – DGC 2024–2026",
+    "query": "Quote the wording on how DGC funds capex in 2024–2026 (cite pages).",
+    "expect_any_page_contains": ["capex", "fund", "financ", "debt", "equity"],
+    "strict": true
+  },
+  {
+    "name": "Cash from ops 2025",
+    "query": "Quote cash from operations 2025 and the exact figure.",
+    "expect_any_page_contains": ["cash flow from operations", "operations"],
+    "strict": true
+  }
+]

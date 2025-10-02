@@ -1,0 +1,12 @@
+version: "3.9"
+services:
+  mwa-bot:
+    build: .
+    ports:
+      - "8005:8005"
+    volumes:
+      - ./data:/app/data
+      - ./index:/app/index
+    environment:
+      - OCR_ENABLED=true
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
