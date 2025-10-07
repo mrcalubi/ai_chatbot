@@ -1,7 +1,6 @@
 # Use a small official Python image
 FROM python:3.11-slim
 
-# Set working directory inside the container
 WORKDIR /app
 
 # Copy dependency list and install it first (good for caching)

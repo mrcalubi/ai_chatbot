@@ -4,8 +4,6 @@ from typing import List, Tuple, Dict, Iterable, Optional
 
 import numpy as np
 import faiss
-from pypdf import PdfReader
-from sentence_transformers import SentenceTransformer
 from rank_bm25 import BM25Okapi
 
 # Config (via environment)
@@ -48,7 +46,6 @@ def _ocr_pages_if_needed(path: str, page_idxs_needing_ocr: List[int]) -> Dict[in
             except Exception:
                 pass
     return out
-
 
 def extract_pdf_pages(path: str) -> Iterable[Dict]:
     """
