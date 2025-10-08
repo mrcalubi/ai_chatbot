@@ -1,62 +1,29 @@
-# ---- Python ----
-__pycache__/
-*.py[cod]
-*.pyo
-*.pyd
-*.so
-*.egg
-*.egg-info/
-dist/
-build/
-.eggs/
-
-# ---- Virtualenv ----
+# Python / venv
 .venv/
 env/
-venv/
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+*.pyo
 
-# ---- Project data ----
-data/
-index/
-uploads/
-logs/
+# Local config & logs
+.env
 *.log
 
-# ---- Environment & secrets ----
-.env
-.env.*
-*.key
-*.pem
+# Build / caches
+.cache/
+dist/
+build/
 
-# ---- OS / Editor ----
+# Frontend
+node_modules/
+
+# App data (do not version)
+data/
+index/
+static/tables/
+
+# OS cruft
 .DS_Store
 Thumbs.db
-*.swp
-*.swo
-*.tmp
-*~
-.idea/
-.vscode/
-*.code-workspace
-
-# ---- Node / Frontend ----
-node_modules/
-npm-debug.log
-yarn-debug.log
-yarn-error.log
-yarn.lock
-package-lock.json
-
-# ---- Docker ----
-*.pid
-*.seed
-*.pid.lock
-
-# ---- Jupyter / R ----
-.ipynb_checkpoints/
-.Rhistory
-.RData
-.Rproj.user/
-
-# ---- Misc ----
-__MACOSX/
