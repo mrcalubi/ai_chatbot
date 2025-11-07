@@ -1,27 +1,102 @@
+# app/rag.py
+# -----------------------------------------------------------------------------
+# PDF Q&A Retrieval Core
+# - Page text extraction WITHOUT pre-snipping table PNGs (lazy PNGs handled
+#   via /tables/png endpoint in main.py).
+# - Table indexing: adds table TEXT as chunks with meta {type:"table", bbox,...}
+# - Hybrid retrieval (FAISS dense + BM25), HyDE query expansion, optional
+#   CrossEncoder re-rank, and MMR diversity.
+# - No strict/evidence-only mode logic here; normal-mode uses these scores.
+# -----------------------------------------------------------------------------
+
+from __future__ import annotations
+
 import os
 import re
-from typing import List, Tuple, Dict, Iterable, Optional
+from pathlib import Path
+from typing import List, Tuple, Dict, Optional
 
 import numpy as np
 import faiss
 from rank_bm25 import BM25Okapi
+import fitz  # PyMuPDF
 
+# Bring in your table detection (text-only) helper
+from .tables import detect_tables_text_only
+
+# -----------------------------
 # Config (via environment)
+# -----------------------------
+EMBED_MODEL = os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 OCR_ENABLED = (os.getenv("OCR_ENABLED", "false").lower() == "true")
-OCR_DPI = int(os.getenv("OCR_DPI", "220"))  # used if OCR is enabled
+OCR_DPI = int(os.getenv("OCR_DPI", "220"))
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-# Text cleanup
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+STATIC_DIR = PROJECT_ROOT / "static"
+TABLE_DIR = STATIC_DIR / "tables"
+os.makedirs(TABLE_DIR, exist_ok=True)
+
+# Skip these vertical zones (points) to avoid header/footer bands that look like tables
+TABLE_SKIP_HEADER_PX = int(os.getenv("TABLE_SKIP_HEADER_PX", "72"))  # ~1 inch
+TABLE_SKIP_FOOTER_PX = int(os.getenv("TABLE_SKIP_FOOTER_PX", "60"))
+
+# Ignore tiny “tables”
+TABLE_MIN_WIDTH_PX = int(os.getenv("TABLE_MIN_WIDTH_PX", "120"))
+TABLE_MIN_HEIGHT_PX = int(os.getenv("TABLE_MIN_HEIGHT_PX", "40"))
+
+# Padding around crops (for legacy snips; not used in lazy flow)
+TABLE_PAD_PX = int(os.getenv("TABLE_PAD_PX", "4"))
+
+# -----------------------------
+# Text cleanup & scoring
+# -----------------------------
 _WS = re.compile(r"\s+")
+
 def _clean_text(t: Optional[str]) -> str:
     return _WS.sub(" ", (t or "")).strip()
 
-# PDF extraction (+ optional OCR fallback)
+_MONTHS = r"January|February|March|April|May|June|July|August|September|October|November|December"
+
+def compute_fact_score(text: str) -> int:
+    """
+    Small, fast heuristic used downstream by reranker.
+    Higher when the chunk looks figure-heavy or date/entity anchored.
+    """
+    score = 0
+    if re.search(r"\b\d+(\.\d+)?\b", text):
+        score += 2
+    if re.search(r"%|\bVND\b|\bUSD\b|\bbn\b|\bmn\b", text, re.IGNORECASE):
+        score += 2
+    if re.search(r"\b20\d{2}\b", text):
+        score += 2
+    if re.search(_MONTHS, text, re.IGNORECASE):
+        score += 1
+    if len(re.findall(r"\b[A-Z][a-z]{2,}\b", text)) > 3:
+        score += 1
+    return score
+
+def is_subjective(text: str) -> bool:
+    subjective_markers = [
+        "we believe","we expect","in our opinion","likely","unlikely",
+        "should","could","may","might","optimistic","cautious",
+        "anticipate","forecast","estimate","suggests","attractive",
+        "undervalued","overvalued","confident","maintain our rating",
+        "reiterate our","initiate coverage"
+    ]
+    t = (text or "").lower()
+    return any(marker in t for marker in subjective_markers)
+
+def _tokenize_for_bm25(text: str) -> List[str]:
+    """Lightweight tokenizer that keeps numerics, currencies, % and dashes."""
+    text = (text or "").lower()
+    text = re.sub(r"[^a-z0-9%.$€£₫¥\- ]+", " ", text)
+    return text.split()
+
+# -----------------------------
+# Optional OCR (best-effort)
+# -----------------------------
 def _ocr_pages_if_needed(path: str, page_idxs_needing_ocr: List[int]) -> Dict[int, str]:
-    """
-    Returns {page_index(0-based): ocr_text} for requested pages.
-    Uses pdf2image + pytesseract only if OCR_ENABLED and libs are available.
-    Silently skips OCR if not available.
-    """
     out: Dict[int, str] = {}
     if not OCR_ENABLED or not page_idxs_needing_ocr:
         return out
@@ -29,10 +104,8 @@ def _ocr_pages_if_needed(path: str, page_idxs_needing_ocr: List[int]) -> Dict[in
         from pdf2image import convert_from_path
         import pytesseract
     except Exception:
-        # OCR libs not installed; skip
         return out
 
-    # Render all pages; cheaper than multiple conversions in many cases
     try:
         images = convert_from_path(path, dpi=OCR_DPI)
     except Exception:
@@ -47,306 +120,388 @@ def _ocr_pages_if_needed(path: str, page_idxs_needing_ocr: List[int]) -> Dict[in
                 pass
     return out
 
-def extract_pdf_pages(path: str) -> Iterable[Dict]:
-    """
-    Yields dicts: {"text": <page text>, "page_number": <1-based int>}
-    - Extracts digital text via PyPDF first.
-    - If OCR is enabled, runs OCR on pages whose extracted text is too short.
-    """
-    reader = PdfReader(path)
-    pages_raw: List[str] = []
-
-    # 1) Try digital text extraction
-    for pg in reader.pages:
-        try:
-            txt = pg.extract_text() or ""
-        except Exception:
-            txt = ""
-        pages_raw.append(_clean_text(txt))
-
-    # 2) Optional OCR for pages that look empty/very short
-    need_ocr: List[int] = [i for i, t in enumerate(pages_raw) if len(t) < 40]
-    if need_ocr:
-        ocr_map = _ocr_pages_if_needed(path, need_ocr)
-        for i, txt in ocr_map.items():
-            if len(txt) > len(pages_raw[i]):
-                pages_raw[i] = txt
-
-    # 3) Yield cleaned pages
-    for i, txt in enumerate(pages_raw, start=1):
-        yield {"text": txt, "page_number": i}
+# -----------------------------
+# Lightweight graph heuristic
+# -----------------------------
+def _is_likely_graph(draw_objs: List[dict]) -> bool:
+    if not draw_objs:
+        return False
+    lines = sum(1 for d in draw_objs if d.get("type") == "line")
+    curves = sum(1 for d in draw_objs if d.get("type") in ("curve", "bezier", "qcurve", "rect"))
+    return curves > (lines * 2 + 10)
 
 # -----------------------------
-# Chunking (page-merged with overlap)
+# PDF extraction (NO eager table PNG snips)
 # -----------------------------
-def chunk_pages(pages: List[Dict], max_chars: int = 3500, overlap: int = 400):
+def extract_pdf_pages(path: str):
     """
-    Merge consecutive PDF pages into larger overlapping chunks.
-    Returns (chunks: List[str], metas: List[{'page': start_page}])
+    Yield dicts:
+      {
+        "doc": <filename>,
+        "text": <page text>,
+        "page_number": <1-based>,
+        "is_table": False,
+        "table_html": "",
+        "table_md": "",
+        "table_img": None,
+      }
     """
-    chunks: List[str] = []
-    metas: List[Dict] = []
-    buf: List[str] = []
-    start_page: Optional[int] = None
-    total = 0
+    path = str(path)
+    doc_name = os.path.basename(path)
+    result_pages: List[Dict] = []
 
-    for p in pages:
-        text = p.get("text", "")
-        page_no = p.get("page_number")
-        if not text:
-            continue
+    # Extract text with PyMuPDF for retrieval context
+    with fitz.open(path) as doc:
+        for i, page in enumerate(doc, start=1):
+            blocks = page.get_text("blocks") or []
+            text_blocks = [b for b in blocks if len(b) >= 5 and isinstance(b[4], str)]
+            raw_text = " ".join(_clean_text(b[4]) for b in text_blocks if b[4])
+            drawings = page.get_drawings() or []
 
-        if start_page is None:
-            start_page = page_no
+            # Always emit a normal page text chunk for retrieval unless clearly chart-only
+            if not _is_likely_graph(drawings):
+                result_pages.append({
+                    "doc": doc_name,
+                    "text": _clean_text(raw_text),
+                    "page_number": i,
+                    "is_table": False,
+                    "table_html": "",
+                    "table_md": "",
+                    "table_img": None,
+                })
 
-        buf.append(f"[p{page_no}] {text}")
-        total += len(text)
+    # Optional OCR for nearly-empty pages
+    ocr_targets = sorted({
+        rp["page_number"] - 1
+        for rp in result_pages
+        if len((rp.get("text") or "").strip()) < 20 and isinstance(rp.get("page_number"), int)
+    })
+    if ocr_targets:
+        ocr_map = _ocr_pages_if_needed(path, ocr_targets)  # {0-based: text}
+        if ocr_map:
+            # Apply OCR text to the last entry we emitted for each page_number.
+            last_idx_by_page: Dict[int, int] = {}
+            for idx, rp in enumerate(result_pages):
+                pn = rp.get("page_number")
+                if isinstance(pn, int):
+                    last_idx_by_page[pn] = idx
+            for zero_based_idx, ocr_text in ocr_map.items():
+                pn = zero_based_idx + 1
+                doc_idx = last_idx_by_page.get(pn)
+                if doc_idx is not None:
+                    result_pages[doc_idx]["text"] = _clean_text(ocr_text)
 
-        if total >= max_chars:
-            joined = "\n".join(buf)
-            chunks.append(joined)
-            metas.append({"page": start_page})
-            # overlap tail
-            tail = joined[max(0, len(joined) - overlap):]
-            buf = [tail]
-            total = len(tail)
-            start_page = page_no
-
-    if buf:
-        joined = "\n".join(buf)
-        chunks.append(joined)
-        metas.append({"page": start_page})
-
-    return chunks, metas
+    # Yield with stable keys
+    for p in result_pages:
+        yield {
+            "doc": p.get("doc", doc_name),
+            "text": p.get("text", ""),
+            "page_number": p.get("page_number"),
+            "is_table": False,
+            "table_html": "",
+            "table_md": "",
+            "table_img": None,
+        }
 
 # -----------------------------
-# Dual-tier chunking (big + small)
+# Chunking (coarse + fine)
 # -----------------------------
-def chunk_pages_dual(pages: List[Dict],
-                     max_chars_big: int = 1800, overlap_big: int = 220,
-                     max_chars_small: int = 480, overlap_small: int = 80):
+def _split_smart(text: str, size: int, overlap: int) -> List[str]:
+    text = text or ""
+    if len(text) <= size:
+        return [text] if text else []
+    out = []
+    start = 0
+    while start < len(text):
+        end = min(len(text), start + size)
+        window = text[start:end]
+        m = re.search(r'([\.:\;\?])\s+\S*$', window)
+        if m and (end - (start + m.end())) < 120:
+            end = start + m.end()
+        seg = text[start:end].strip()
+        if seg:
+            out.append(seg)
+        start = max(end - overlap, start + 1)
+    return out
+
+def chunk_pages_dual(pages, big_size=1600, small_size=600, overlap=60):
+    """
+    Returns: (big_chunks, big_meta), (small_chunks, small_meta)
+    """
     big_chunks, big_meta = [], []
     small_chunks, small_meta = [], []
-    buf, start_page, total = [], None, 0
 
     for p in pages:
         text = p.get("text", "") or ""
-        page = p.get("page_number")
-        if not text:
-            continue
-        if start_page is None:
-            start_page = page
+        page_num = p.get("page_number")
 
-        page_block = f"[p{page}] {text}"
-        # big track
-        buf.append(page_block)
-        total += len(page_block)
+        # Coarse chunks (sentence-aware)
+        bigs = _split_smart(text, big_size, overlap)
+        for c in bigs:
+            big_meta.append({
+                "doc": p.get("doc", ""),
+                "page": page_num,
+                "fact_score": compute_fact_score(c),
+                "subjective": is_subjective(c),
+                "is_table": False,
+            })
+            big_chunks.append(c)
 
-        # small slices per page
-        t = page_block
-        i = 0
-        while i < len(t):
-            piece = t[i:i + max_chars_small]
-            small_chunks.append(piece)
-            small_meta.append({"page": page})
-            if len(piece) < max_chars_small:
-                break
-            i += max_chars_small - overlap_small
-
-        # flush big
-        if total >= max_chars_big:
-            joined = "\n".join(buf)
-            big_chunks.append(joined)
-            big_meta.append({"page": start_page})
-            tail = joined[max(0, len(joined) - overlap_big):]
-            buf, total, start_page = [tail], len(tail), page
-
-    if buf:
-        joined = "\n".join(buf)
-        big_chunks.append(joined)
-        big_meta.append({"page": start_page})
+        # Fine-grained sliding
+        smalls = _split_smart(text, small_size, overlap)
+        for c in smalls:
+            small_meta.append({
+                "doc": p.get("doc", ""),
+                "page": page_num,
+                "fact_score": compute_fact_score(c),
+                "subjective": is_subjective(c),
+                "is_table": False,
+            })
+            small_chunks.append(c)
 
     return (big_chunks, big_meta), (small_chunks, small_meta)
 
 # -----------------------------
-# Fusion & Diversity helpers
+# Table TEXT indexing (lazy PNGs are handled elsewhere)
 # -----------------------------
-def rrf_fuse(bm25_hits: List[Tuple[int, float]],
-             dense_hits: List[Tuple[int, float]],
-             k: int = 50,
-             c: int = 60) -> List[Tuple[int, float]]:
+def table_chunks_for_doc(pdf_path: Path) -> Tuple[List[str], List[Dict]]:
     """
-    Reciprocal Rank Fusion (RRF).
-    Inputs: lists of (index, score) in ranked order.
-    Output: list of (index, fused_score) truncated to k.
+    Detect tables via detect_tables_text_only() and return (texts, metas) to index.
+    meta includes:
+      {
+        "doc": <name>,
+        "page": <1-based>,
+        "type": "table",
+        "table_id": <stable id>,
+        "bbox": [x0, y0, x1, y1]  # PDF coordinate space (float)
+      }
     """
-    ranks: Dict[int, float] = {}
-    # preserve order ranking (1-based)
-    for hits in (bm25_hits, dense_hits):
-        for r, (idx, _score) in enumerate(hits, start=1):
-            ranks[idx] = ranks.get(idx, 0.0) + 1.0 / (c + r)
-    fused = sorted(ranks.items(), key=lambda x: x[1], reverse=True)[:k]
-    return [(i, float(s)) for i, s in fused]
+    texts: List[str] = []
+    metas: List[Dict] = []
+    for tm in detect_tables_text_only(pdf_path):
+        texts.append(tm.text)
+        metas.append({
+            "doc": tm.doc,
+            "page": tm.page + 1,  # 1-based for UI/citations
+            "type": "table",
+            "table_id": tm.table_id,
+            "bbox": list(tm.bbox),
+        })
+    return texts, metas
 
-def mmr_select(query_vec: np.ndarray,
-               cand_embs: np.ndarray,
-               lam: float = 0.7,
-               topn: int = 12) -> List[int]:
-    """
-    Maximal Marginal Relevance selection.
-    Returns indices into cand_embs in selected order.
-    """
-    if cand_embs.size == 0:
+# -----------------------------
+# Embeddings (SentenceTransformers or OpenAI)
+# -----------------------------
+def _is_openai_model(name: str) -> bool:
+    return name.lower().startswith("openai/")
+
+def _openai_dim(name: str) -> int:
+    nm = name.lower()
+    if "text-embedding-3-large" in nm:
+        return 3072
+    return 1536
+
+class _STEncoder:
+    def __init__(self, model_name: str):
+        from sentence_transformers import SentenceTransformer
+        self.model = SentenceTransformer(model_name)
+        self.dim = self.model.get_sentence_embedding_dimension()
+    def encode(self, texts: List[str]) -> np.ndarray:
+        embs = self.model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+        return np.asarray(embs, dtype="float32")
+
+class _OpenAIEncoder:
+    def __init__(self, model_name: str, api_key: str):
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY required for OpenAI embeddings.")
+        from openai import OpenAI
+        self.client = OpenAI(api_key=api_key)
+        self.model = model_name.replace("openai/", "")
+        self.dim = _openai_dim(model_name)
+    def encode(self, texts: List[str]) -> np.ndarray:
+        out: List[np.ndarray] = []
+        B = 64
+        for i in range(0, len(texts), B):
+            batch = texts[i:i+B]
+            resp = self.client.embeddings.create(model=self.model, input=batch)
+            vecs = [np.asarray(d.embedding, dtype="float32") for d in resp.data]
+            out.append(np.vstack(vecs))
+        embs = np.vstack(out) if out else np.zeros((0, self.dim), dtype="float32")
+        norms = np.linalg.norm(embs, axis=1, keepdims=True) + 1e-9
+        embs = embs / norms
+        return embs
+
+def _build_encoder(name: str):
+    if _is_openai_model(name):
+        enc = _OpenAIEncoder(name, OPENAI_API_KEY)
+        return enc, enc.dim
+    else:
+        enc = _STEncoder(name)
+        return enc, enc.dim
+
+# -----------------------------
+# Optional Cross-Encoder reranker (small & fast). Safe if unavailable.
+# -----------------------------
+try:
+    from sentence_transformers import CrossEncoder  # type: ignore
+    _CE = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+except Exception:
+    _CE = None
+
+def _hyde_prompts(q: str) -> List[str]:
+    return [
+        f"Write a concise passage that answers: {q}",
+        f"Paraphrase and broaden with synonyms: {q}",
+    ]
+
+def _hyde(llm_fn, q: str, k: int = 2) -> List[str]:
+    if not llm_fn:
         return []
-    # cosine sims (already normalized by _encode)
-    q = query_vec.reshape(1, -1)
-    sims = (cand_embs @ q.T).ravel()  # relevance to query
-    selected: List[int] = []
-    remaining = list(range(cand_embs.shape[0]))
-
-    while remaining and len(selected) < topn:
-        if not selected:
-            # pick most relevant first
-            j = max(remaining, key=lambda i: sims[i])
-            selected.append(j)
-            remaining.remove(j)
-            continue
-        # compute redundancy vs. already selected
-        sel_embs = cand_embs[selected]
-        # max similarity to any selected
-        red = np.max(cand_embs[remaining] @ sel_embs.T, axis=1)
-        # mmr score
-        mmr_scores = lam * sims[remaining] - (1 - lam) * red
-        j_rel = int(np.argmax(mmr_scores))
-        j = remaining[j_rel]
-        selected.append(j)
-        remaining.remove(j)
-
-    return selected
+    outs: List[str] = []
+    for p in _hyde_prompts(q)[:k]:
+        try:
+            r = llm_fn(p)
+            if r:
+                outs.append(r.strip())
+        except Exception:
+            pass
+    return [o for o in outs if o]
 
 # -----------------------------
-# Vector store (FAISS + ST + BM25 hybrid)
+# Vector store (FAISS + BM25 hybrid)
 # -----------------------------
 class VectorStore:
-    """
-    FAISS + SentenceTransformers cosine-sim store (dense)
-    + BM25 (sparse) hybrid.
-    Persists index + texts + metadata on disk and keeps them in sync.
-    """
     def __init__(self, index_dir: str, embed_model: str):
         self.index_dir = index_dir
         os.makedirs(index_dir, exist_ok=True)
 
-        self.model = SentenceTransformer(embed_model)
-        self.dim = self.model.get_sentence_embedding_dimension()
+        self.embed_model_name = embed_model
+        self.encoder, self.dim = _build_encoder(self.embed_model_name)
 
         self.index_path = os.path.join(index_dir, "faiss.index")
         self.meta_path = os.path.join(index_dir, "meta.npy")
         self.text_path = os.path.join(index_dir, "texts.npy")
 
+        self._new_index()
+        self.meta: List[dict] = []
+        self.texts: List[str] = []
         self._load()
 
-        # BM25 bits
-        self._tokenizer = re.compile(r"[A-Za-z0-9%\-]+").findall
         self._bm25: Optional[BM25Okapi] = None
         self._bm25_tokens: List[List[str]] = []
         self._build_bm25()
 
-    # ---------- BM25 helpers ----------
+    # ---------- BM25 ----------
     def _build_bm25(self):
         corpus = self.texts or []
-        self._bm25_tokens = [self._tokenizer((t or "").lower()) for t in corpus]
+        self._bm25_tokens = [_tokenize_for_bm25(t or "") for t in corpus]
         self._bm25 = BM25Okapi(self._bm25_tokens) if self._bm25_tokens else None
 
     def _after_storage_change(self):
-        # call whenever texts/meta/index changed
         self._build_bm25()
         self._save()
 
     # ---------- persistence ----------
     def _new_index(self):
-        # Inner product + normalized vectors -> cosine similarity
         self.index = faiss.IndexFlatIP(self.dim)
 
     def _load(self):
-        if os.path.exists(self.index_path):
-            self.index = faiss.read_index(self.index_path)
+        if os.path.exists(self.index_path) and os.path.exists(self.meta_path) and os.path.exists(self.text_path):
             try:
-                self.meta = np.load(self.meta_path, allow_pickle=True).tolist()
+                idx = faiss.read_index(self.index_path)
+                if idx.d != self.dim:
+                    # Rebuild from persisted texts
+                    self.meta = np.load(self.meta_path, allow_pickle=True).tolist()
+                    self.texts = np.load(self.text_path, allow_pickle=True).tolist()
+                    self._new_index()
+                    if self.texts:
+                        embs = self._encode(self.texts)
+                        self.index.add(embs)
+                    self._save()
+                else:
+                    self.index = idx
+                    self.meta = np.load(self.meta_path, allow_pickle=True).tolist()
+                    self.texts = np.load(self.text_path, allow_pickle=True).tolist()
             except Exception:
-                self.meta = []
-            try:
-                self.texts = np.load(self.text_path, allow_pickle=True).tolist()
-            except Exception:
-                self.texts = []
-
-            # keep lengths consistent with index.ntotal
-            n = min(self.index.ntotal, len(self.meta), len(self.texts))
-            if n < self.index.ntotal:
-                # safest reset if mismatch
+                try:
+                    self.meta = np.load(self.meta_path, allow_pickle=True).tolist()
+                    self.texts = np.load(self.text_path, allow_pickle=True).tolist()
+                except Exception:
+                    self.meta, self.texts = [], []
                 self._new_index()
-            self.meta = self.meta[:n]
-            self.texts = self.texts[:n]
+                if self.texts:
+                    embs = self._encode(self.texts)
+                    self.index.add(embs)
+                self._save()
         else:
+            self.meta, self.texts = [], []
             self._new_index()
-            self.meta = []
-            self.texts = []
+            self._save()
+
+        n = min(getattr(self.index, "ntotal", 0), len(self.meta), len(self.texts))
+        if n != getattr(self.index, "ntotal", 0):
+            self._new_index()
+            if n > 0:
+                embs = self._encode(self.texts[:n])
+                self.index.add(embs)
+        self.meta = self.meta[:n]
+        self.texts = self.texts[:n]
 
     def remove_docs(self, docs: List[str]) -> int:
-        """
-        Remove all chunks belonging to the given doc filenames.
-        Returns the number of chunks removed.
-        """
-        to_remove = set((docs or []))
+        """Remove all chunks belonging to any basename in docs (flexible matching)."""
+        to_remove = set(docs or [])
         if not to_remove:
             return 0
 
-        n_before = len(self.meta)
-        keep_idx = [i for i, m in enumerate(self.meta) if (m or {}).get("doc") not in to_remove]
+        def norm(s: str) -> str:
+            return os.path.basename((s or "").strip()).lower()
 
-        # Nothing to remove
-        if len(keep_idx) == n_before:
+        # Build norm map of stored docs
+        norm_map: Dict[str, List[int]] = {}
+        for i, m in enumerate(self.meta):
+            d = norm(m.get("doc") or "")
+            norm_map.setdefault(d, []).append(i)
+
+        # Resolve input -> indices
+        drop: set[int] = set()
+        for asked in to_remove:
+            key = norm(asked)
+            for idx in norm_map.get(key, []):
+                drop.add(idx)
+
+        if not drop:
             return 0
 
-        # Keep only remaining items
-        self.texts = [self.texts[i] for i in keep_idx]
-        self.meta  = [self.meta[i]  for i in keep_idx]
+        keep = [i for i in range(len(self.meta)) if i not in drop]
+        self.meta = [self.meta[i] for i in keep]
+        self.texts = [self.texts[i] for i in keep]
 
-        # Rebuild FAISS from scratch for consistency
         self._new_index()
         if self.texts:
             embs = self._encode(self.texts)
             self.index.add(embs)
-
-        # Rebuild BM25 + persist
         self._after_storage_change()
-
-        return n_before - len(self.meta)
-
+        return len(drop)
 
     def _save(self):
         faiss.write_index(self.index, self.index_path)
-        np.save(self.meta_path, np.array(self.meta, dtype=object))
-        np.save(self.text_path, np.array(self.texts, dtype=object))
+        np.save(self.meta_path, np.array(self.meta, dtype=object), allow_pickle=True)
+        np.save(self.text_path, np.array(self.texts, dtype=object), allow_pickle=True)
 
     # ---------- encode ----------
     def _encode(self, texts: List[str]) -> np.ndarray:
-        embs = self.model.encode(texts, normalize_embeddings=True)
-        return np.asarray(embs, dtype="float32")
+        return self.encoder.encode(texts)
 
-    # ---------- mutations ----------
+    # ---------- add ----------
     def add(self, chunks: List[str], metas: List[dict]):
         if not chunks:
             return
-        # ensure metas length matches chunks
         if len(metas) != len(chunks):
             m = (metas or [])
             if len(m) < len(chunks):
                 m = m + [{}] * (len(chunks) - len(m))
             metas = m[:len(chunks)]
-
         embs = self._encode(chunks)
-        # build a new empty index if somehow missing
         if getattr(self, "index", None) is None:
             self._new_index()
         self.index.add(embs)
@@ -359,24 +514,18 @@ class VectorStore:
         n = len(self.texts or [])
         if n == 0:
             return []
-
-        # cap k to available items (prevents FAISS -1 ids)
         k = max(1, min(k, n))
-
-        # if index count drifted, rebuild safely
         if getattr(self.index, "ntotal", 0) != n:
             self._new_index()
             if n > 0:
                 embs = self._encode(self.texts)
                 self.index.add(embs)
                 self._save()
-
         q = self._encode([query])
         try:
             D, I = self.index.search(q, k)
         except Exception:
             return []
-
         out: List[Tuple[str, dict, float]] = []
         seen = set()
         for idx, score in zip(I[0], D[0]):
@@ -390,23 +539,22 @@ class VectorStore:
             out.append((self.texts[idx], self.meta[idx], float(score)))
         return out
 
-    # ---------- search (hybrid: dense + BM25) ----------
+    # ---------- search (hybrid: FAISS + BM25 + HyDE + CE + MMR) ----------
     def search_hybrid(
         self,
         query: str,
         k: int = 12,
         alpha: float = 0.65,
         *,
-        strategy: str = "alpha",  # "alpha" (blend) or "rrf"
-        pre_k: Optional[int] = None,  # how many to consider before final k
-        mmr_topn: Optional[int] = None,  # if set, apply MMR diversity
-        mmr_lambda: float = 0.7,
+        strategy: str = "alpha",         # 'alpha' or 'rrf'
+        pre_k: Optional[int] = None,     # fused short-list size
+        mmr_topn: Optional[int] = None,  # e.g., 12
+        mmr_lambda: float = 0.7,         # diversity strength
+        llm_fn=None,                     # for HyDE expansions
+        use_ce: bool = True,             # CrossEncoder rerank if available
     ) -> List[Tuple[str, dict, float]]:
         """
-        Hybrid retrieval:
-          - strategy="alpha": normalized linear blend (existing behavior)
-          - strategy="rrf": Reciprocal Rank Fusion
-          - Optionally apply MMR to diversify the final top-k.
+        Returns list of (chunk_text, chunk_meta, fused_score)
         """
         n = len(self.texts or [])
         if n == 0:
@@ -414,7 +562,11 @@ class VectorStore:
         k = max(1, min(k, n))
         pre_k = max(k, 50) if pre_k is None else max(k, min(pre_k, n))
 
-        # ensure FAISS index matches data
+        q_clean = (query or "").strip()
+        if not q_clean:
+            return []
+
+        # Keep FAISS in sync (defensive)
         if getattr(self.index, "ntotal", 0) != n:
             self._new_index()
             if n > 0:
@@ -422,39 +574,50 @@ class VectorStore:
                 self.index.add(embs)
                 self._save()
 
-        # ----- dense (top pre_k) -----
+        # 1) Query expansions (HyDE)
+        queries = [q_clean] + _hyde(llm_fn, q_clean, k=2)
+
+        # 2) Retrieve candidates from both dense and BM25 for each expansion
         dense_hits: List[Tuple[int, float]] = []
-        try:
-            q_vec = self._encode([query])  # shape (1, dim)
-            D, I = self.index.search(q_vec, pre_k)
-            for idx, score in zip(I[0], D[0]):
-                if idx is not None and 0 <= idx < n:
-                    dense_hits.append((int(idx), float(score)))
-        except Exception:
-            # dense fails -> leave empty
-            q_vec = None  # type: ignore
-
-        # ----- bm25 (top pre_k) -----
         bm25_hits: List[Tuple[int, float]] = []
-        if self._bm25 is not None:
-            toks = self._tokenizer(query.lower())
-            scores = self._bm25.get_scores(toks)
-            order = np.argsort(scores)[::-1][:pre_k]
-            for idx in order:
-                s = float(scores[idx])
-                if s > 0:
-                    bm25_hits.append((int(idx), s))
+        seen = set()
 
-        # Fallback: if both failed, return []
+        for qx in queries:
+            # Dense cosine (inner product of normalized embs)
+            try:
+                qv = self._encode([qx])  # shape (1, dim)
+                D, I = self.index.search(qv, max(1, pre_k // 2))
+                for idx, score in zip(I[0], D[0]):
+                    if 0 <= idx < n and idx not in seen:
+                        dense_hits.append((int(idx), float(score)))
+                        seen.add(int(idx))
+            except Exception:
+                pass
+
+            # Lexical BM25
+            if self._bm25 is not None:
+                toks = _tokenize_for_bm25(qx)
+                scores = self._bm25.get_scores(toks)
+                order = np.argsort(scores)[::-1][:max(1, pre_k // 2)]
+                for idx in order:
+                    s = float(scores[idx])
+                    if s > 0 and int(idx) not in seen:
+                        bm25_hits.append((int(idx), s))
+                        seen.add(int(idx))
+
         if not dense_hits and not bm25_hits:
             return []
 
-        # ----- fusion -----
-        fused_indices_scores: List[Tuple[int, float]]
+        # 3) Fuse lexical + dense candidates
         if strategy == "rrf":
-            fused_indices_scores = rrf_fuse(bm25_hits=bm25_hits, dense_hits=dense_hits, k=pre_k, c=60)
+            # Reciprocal Rank Fusion
+            ranks: Dict[int, float] = {}
+            for hits in (bm25_hits, dense_hits):
+                for r, (idx, _score) in enumerate(hits, start=1):
+                    ranks[idx] = ranks.get(idx, 0.0) + 1.0 / (60 + r)
+            fused_pairs = sorted(ranks.items(), key=lambda x: x[1], reverse=True)[:pre_k]
         else:
-            # normalized alpha blend (backward-compatible default)
+            # Alpha fusion (normalized)
             def _norm(pairs: List[Tuple[int, float]]):
                 if not pairs:
                     return {}
@@ -463,28 +626,56 @@ class VectorStore:
                 if hi - lo < 1e-9:
                     return {i: 1.0 for i, _ in pairs}
                 return {i: (s - lo) / (hi - lo) for i, s in pairs}
+
             dn = _norm(dense_hits)
             bn = _norm(bm25_hits)
-            combined: Dict[int, float] = {}
-            for i, s in dn.items():
-                combined[i] = combined.get(i, 0.0) + alpha * s
-            for i, s in bn.items():
-                combined[i] = combined.get(i, 0.0) + (1.0 - alpha) * s
-            fused_indices_scores = sorted(combined.items(), key=lambda x: x[1], reverse=True)[:pre_k]
+            combined: Dict[int, float] = {
+                i: alpha * dn.get(i, 0.0) + (1 - alpha) * bn.get(i, 0.0)
+                for i in set(list(dn.keys()) + list(bn.keys()))
+            }
+            fused_pairs = sorted(combined.items(), key=lambda x: x[1], reverse=True)[:pre_k]
 
-        # ----- optional MMR diversity -----
-        cand_idxs = [i for i, _ in fused_indices_scores]
-        cand_scores = {i: sc for i, sc in fused_indices_scores}
+        cand_idxs = [i for i, _ in fused_pairs]
+        cand_scores = {i: sc for i, sc in fused_pairs}
 
-        if mmr_topn and mmr_topn > 0 and q_vec is not None:
-            cand_texts = [self.texts[i] for i in cand_idxs]
-            cand_embs = self._encode(cand_texts)  # (C, dim), normalized
-            sel_local = mmr_select(q_vec[0], cand_embs, lam=mmr_lambda, topn=min(mmr_topn, k))
-            sel_global = [cand_idxs[j] for j in sel_local]
-            # build output in MMR order (use fused scores for reporting)
-            out = [(self.texts[i], self.meta[i], float(cand_scores.get(i, 0.0))) for i in sel_global]
-            return out[:k]
+        # 4) Optional CrossEncoder re-rank on fused short-list
+        if use_ce and _CE and cand_idxs:
+            pairs = [(query, self.texts[i]) for i in cand_idxs[:max(k * 3, 24)]]
+            try:
+                ce_scores = _CE.predict(pairs)
+                order = sorted(range(len(pairs)), key=lambda j: float(ce_scores[j]), reverse=True)
+                cand_idxs = [cand_idxs[j] for j in order]
+            except Exception:
+                pass
 
-        # ----- no MMR: just take top-k fused -----
+        # 5) Optional MMR for diversity (using dense embeddings)
+        if mmr_topn and mmr_topn > 0:
+            try:
+                qv = self._encode([q_clean])[0:1]  # shape (1, dim)
+                cand_texts = [self.texts[i] for i in cand_idxs]
+                cand_embs = self._encode(cand_texts)
+                sims = (cand_embs @ qv.T).ravel()
+                selected: List[int] = []
+                remaining = list(range(cand_embs.shape[0]))
+                while remaining and len(selected) < min(mmr_topn, k):
+                    if not selected:
+                        j0 = int(np.argmax(sims[remaining]))
+                        pick = remaining[j0]
+                        selected.append(pick)
+                        remaining.remove(pick)
+                        continue
+                    sel = cand_embs[selected]
+                    redundancy = np.max(cand_embs[remaining] @ sel.T, axis=1)
+                    lam = float(mmr_lambda)
+                    mmr = lam * sims[remaining] - (1 - lam) * redundancy
+                    j = int(np.argmax(mmr))
+                    pick = remaining[j]
+                    selected.append(pick)
+                    remaining.remove(pick)
+                cand_idxs = [cand_idxs[j] for j in selected]
+            except Exception:
+                pass
+
+        # Final top-k
         out = [(self.texts[i], self.meta[i], float(cand_scores.get(i, 0.0))) for i in cand_idxs[:k]]
         return out
