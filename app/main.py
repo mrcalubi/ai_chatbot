@@ -208,7 +208,7 @@ def expand_query(q: str) -> List[str]:
 
 # ---- Intent helpers ----
 SUMMARIZE_PAT = re.compile(
-    r"\b(summarize|summary|overview|key ideas|key points|main points|high level|valuation|investment thesis)\b",
+    r"\b(summarize|summarise|summary|summaries|overview|key ideas|key points|main points|high level|valuation|investment thesis|consensus|broker.*consensus)\b",
     re.IGNORECASE
 )
 def looks_like_summarize_intent(q: str) -> bool:
@@ -913,21 +913,35 @@ async def chat(req: ChatRequest):
 
     # ---- Summarize-intent path
     if looks_like_summarize_intent(req.query):
-        texts = getattr(store, "texts", []) or []
-        metas = getattr(store, "meta", []) or []
-        all_items = [(t, m, 0.0) for t, m in zip(texts, metas)]
-        # Scope filter if any
-        if scope_docs:
-            all_items = [(t, m, 0.0) for (t, m, _) in all_items if (m or {}).get("doc") in set(scope_docs)]
-        rep = pick_representative_chunks(all_items, limit_chars=6500, prefer_early_pages=True)
+        # For summarize queries, use retrieved hits first (they're query-relevant)
+        # Then supplement with representative chunks if needed
+        summarize_hits = []
+        if deduped:
+            # Use the retrieved hits (they're already query-relevant)
+            summarize_hits = [(t, m, 0.0) for (t, m, _) in deduped[:max(k, 15)]]
+        else:
+            # Fallback: pick representative chunks if no hits
+            texts = getattr(store, "texts", []) or []
+            metas = getattr(store, "meta", []) or []
+            all_items = [(t, m, 0.0) for t, m in zip(texts, metas)]
+            # Scope filter if any
+            if scope_docs:
+                all_items = [(t, m, 0.0) for (t, m, _) in all_items if (m or {}).get("doc") in set(scope_docs)]
+            summarize_hits = pick_representative_chunks(all_items, limit_chars=6500, prefer_early_pages=True)
+            summarize_hits = [(t, m) for (t, m) in summarize_hits]
 
         context_blocks, cites = [], []
-        for (text, meta) in rep:
+        for item in summarize_hits:
+            if len(item) == 3:
+                text, meta, _ = item
+            else:
+                text, meta = item
             doc = (meta or {}).get("doc", "UnknownDoc")
             page = (meta or {}).get("page")
             snippet = (text or "")[:1200]
-            context_blocks.append(f"[Document: {doc}, Page: {page}]\n{snippet}")
-            cites.append(Citation(doc=doc, page=page, snippet=_truncate_at_word_boundary(snippet, 280)))
+            if snippet.strip():  # Only add non-empty snippets
+                context_blocks.append(f"[Document: {doc}, Page: {page}]\n{snippet}")
+                cites.append(Citation(doc=doc, page=page, snippet=_truncate_at_word_boundary(snippet, 280)))
 
         if not context_blocks:
             try:
@@ -938,10 +952,14 @@ async def chat(req: ChatRequest):
             return ChatResponse(answer="I couldn't build a summary from the uploaded PDFs.", citations=[], found=False)
 
         context_str = "\n\n---\n\n".join(context_blocks)
+        print(f"[summarize] Built {len(context_blocks)} context blocks, total chars: {len(context_str)}")
+        
         guardrails = (
-            "\n\nCRITICAL REMINDERS:\n"
-            "- NEVER invent or estimate numbers or facts not in the context above.\n"
-            "- If information is not in the context, state: 'This information is not available in the uploaded PDFs.'\n"
+            "\n\nIMPORTANT REMINDERS:\n"
+            "- Synthesize information from the context to provide a comprehensive answer.\n"
+            "- For summarize/consensus questions, extract and synthesize key themes from the broker reports.\n"
+            "- Look for broker opinions, ratings, forecasts, and key findings across all provided documents.\n"
+            "- Only state 'not available' for specific facts that are truly missing from the context.\n"
             "- ALWAYS cite sources using the exact format: (Filename.pdf, p.5) - do NOT use dashes or other formats.\n"
             "- Use **bold** headings, bullets for key facts.\n"
             "- Citations must be inline within sentences, not at the end as separate lines.\n"
@@ -961,11 +979,24 @@ async def chat(req: ChatRequest):
             )
             if resp and resp.choices:
                 llm_answer = (resp.choices[0].message.content or "").strip()
-        except Exception:
+        except Exception as e:
+            print(f"[summarize] LLM error: {e}")
             pass
 
-        tables_html = _collect_table_badges([(t, m, 0.0) for (t, m) in rep], max_tables=6)
-        final_answer = (llm_answer or "I couldn't build a summary from the uploaded PDFs.")
+        if not llm_answer or len(llm_answer.strip()) < 20:
+            llm_answer = "I couldn't build a summary from the uploaded PDFs. Please try rephrasing your question or check if the relevant documents are uploaded."
+
+        # Prepare hits for table badges
+        table_badge_hits = []
+        for item in summarize_hits[:10]:
+            if len(item) == 3:
+                t, m, _ = item
+                table_badge_hits.append((t, m, 0.0))
+            else:
+                t, m = item
+                table_badge_hits.append((t, m, 0.0))
+        tables_html = _collect_table_badges(table_badge_hits, max_tables=6)
+        final_answer = llm_answer
         if tables_html:
             final_answer += "\n\n" + tables_html
 
@@ -1323,12 +1354,21 @@ async def chat_stream(req: ChatRequest):
     # Build context & citations
     context_blocks, cites = _build_context_and_cites(hits)
     context_str = "\n\n---\n\n".join(context_blocks) if context_blocks else "(no matching excerpts)"
+    
+    # Debug logging
+    print(f"[stream] Built {len(context_blocks)} context blocks, {len(cites)} citations")
+    if context_blocks:
+        print(f"[stream] Context preview: {context_str[:200]}...")
+    else:
+        print(f"[stream] WARNING: No context blocks built from {len(hits)} hits")
+    
     header = {"type": "meta", "citations": [c.dict() for c in cites]}
 
     guardrails = (
-        "\n\nCRITICAL REMINDERS:\n"
-        "- NEVER invent or estimate a number or fact not present in the context.\n"
-        "- If a specific figure is not in the context, say: 'This information is not available in the uploaded PDFs.'\n"
+        "\n\nIMPORTANT REMINDERS:\n"
+        "- Synthesize information from the context to answer the question comprehensively.\n"
+        "- For summarize/consensus questions, extract key themes and findings from all relevant sources.\n"
+        "- Only state 'not available' for specific facts that are truly missing from the context.\n"
         "- ALWAYS cite sources using the exact format: (Filename.pdf, p.5) - do NOT use dashes, brackets, or other formats.\n"
         "- Citations must be inline within sentences using parentheses format.\n"
         "- Prefer natural-language sentences; ignore table-like number runs.\n"
