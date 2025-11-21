@@ -1,0 +1,10 @@
+{
+  "name": "mwa-ai-chatbot",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "build": "echo \"no-op build for static web/ deployment\""
+  }
+}
+
+
