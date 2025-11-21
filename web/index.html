@@ -252,8 +252,25 @@
 
 
     /* ---------- API base ---------- */
-    let API = location.origin;
-    if (!/^https?:\/\//.test(API) || API === 'null') API = 'http://127.0.0.1:8000';
+    // Strategy:
+    // 1) If ?api=... is present in the URL, use that (handy for testing different backends).
+    // 2) If running on Vercel (hostname ends with vercel.app), point to a hosted FastAPI backend.
+    // 3) Otherwise, default to local dev backend at http://127.0.0.1:8000.
+    const params = new URLSearchParams(location.search);
+    const apiOverride = params.get('api');
+    const isVercel = location.hostname.endsWith('vercel.app');
+
+    let API;
+    if (apiOverride) {
+      API = apiOverride.replace(/\/+$/, ''); // strip trailing slash
+    } else if (isVercel) {
+      // TODO: replace this placeholder with your deployed FastAPI URL
+      // e.g. 'https://mwa-ai-chatbot-api.your-domain.com'
+      API = 'https://YOUR-BACKEND-URL-HERE';
+    } else {
+      API = 'http://127.0.0.1:8000';
+    }
+
     document.getElementById("apiLabel").textContent = API;
 
     fetch(API + '/health').then(r=>r.json()).then(()=>{
