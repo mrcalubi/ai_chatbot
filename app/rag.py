@@ -27,15 +27,28 @@ from .tables import detect_tables_text_only
 # -----------------------------
 # Config (via environment)
 # -----------------------------
-EMBED_MODEL = os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+EMBED_MODEL = os.getenv("EMBED_MODEL", "intfloat/multilingual-e5-base")
 OCR_ENABLED = (os.getenv("OCR_ENABLED", "false").lower() == "true")
 OCR_DPI = int(os.getenv("OCR_DPI", "220"))
+OCR_LANGUAGE = os.getenv("OCR_LANGUAGE", "eng")  # Options: 'eng', 'vie', 'vie+eng'
+AUTO_DETECT_LANGUAGE = (os.getenv("AUTO_DETECT_LANGUAGE", "true").lower() == "true")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+TRANSLATION_ENABLED = (os.getenv("TRANSLATION_ENABLED", "true").lower() == "true")
+TRANSLATION_SOURCE_LANGS = {lang.strip().lower() for lang in os.getenv("TRANSLATION_SOURCE_LANGS", "vi").split(',') if lang.strip()}
+TRANSLATION_MODEL = os.getenv("TRANSLATION_MODEL", "gpt-4o-mini")
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 STATIC_DIR = PROJECT_ROOT / "static"
 TABLE_DIR = STATIC_DIR / "tables"
 os.makedirs(TABLE_DIR, exist_ok=True)
+
+if TRANSLATION_ENABLED:
+    try:
+        from .translation import translate_text
+    except Exception:
+        translate_text = None
+else:
+    translate_text = None
 
 # Skip these vertical zones (points) to avoid header/footer bands that look like tables
 TABLE_SKIP_HEADER_PX = int(os.getenv("TABLE_SKIP_HEADER_PX", "72"))  # ~1 inch
@@ -93,18 +106,70 @@ def _tokenize_for_bm25(text: str) -> List[str]:
     text = re.sub(r"[^a-z0-9%.$€£₫¥\- ]+", " ", text)
     return text.split()
 
+def _clip_text(text: str, limit: int = 800) -> str:
+    text = text or ""
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + " …"
+
+def _should_translate(language: str) -> bool:
+    if not TRANSLATION_ENABLED or not translate_text:
+        return False
+    if not language:
+        return False
+    return language.lower() in TRANSLATION_SOURCE_LANGS
+
+def _translate_text_if_needed(text: str, language: str) -> Optional[str]:
+    if not _should_translate(language) or not text or len(text.strip()) < 25:
+        return None
+    try:
+        translated = translate_text(text, source_lang=language or 'vi', target_lang='en')
+        if translated and translated.strip():
+            return translated.strip()
+    except Exception as exc:
+        print(f"[translation] Failed to translate chunk: {exc}")
+    return None
+
 # -----------------------------
-# Optional OCR (best-effort)
+# Optional OCR (best-effort) with language support
 # -----------------------------
-def _ocr_pages_if_needed(path: str, page_idxs_needing_ocr: List[int]) -> Dict[int, str]:
+def _ocr_pages_if_needed(path: str, page_idxs_needing_ocr: List[int], language: str = None) -> Dict[int, str]:
+    """
+    OCR pages with language support (English or Vietnamese).
+    
+    Args:
+        path: Path to PDF file
+        page_idxs_needing_ocr: List of 0-based page indices needing OCR
+        language: Language code ('eng', 'vie', or None for auto-detect)
+    
+    Returns:
+        Dictionary mapping page index to OCR text
+    """
     out: Dict[int, str] = {}
     if not OCR_ENABLED or not page_idxs_needing_ocr:
         return out
+    
     try:
         from pdf2image import convert_from_path
         import pytesseract
     except Exception:
         return out
+
+    # Determine OCR language
+    ocr_lang = language or OCR_LANGUAGE
+    if AUTO_DETECT_LANGUAGE and language is None:
+        # Try to auto-detect language from PDF
+        try:
+            from .language_detection import detect_pdf_language
+            detected = detect_pdf_language(path, sample_pages=2)
+            if detected == 'vi':
+                ocr_lang = 'vie'
+            elif detected == 'mixed':
+                ocr_lang = 'vie+eng'  # Use both languages
+            else:
+                ocr_lang = 'eng'  # Default to English
+        except Exception:
+            ocr_lang = OCR_LANGUAGE  # Fallback to config
 
     try:
         images = convert_from_path(path, dpi=OCR_DPI)
@@ -114,10 +179,16 @@ def _ocr_pages_if_needed(path: str, page_idxs_needing_ocr: List[int]) -> Dict[in
     for idx in page_idxs_needing_ocr:
         if 0 <= idx < len(images):
             try:
-                txt = pytesseract.image_to_string(images[idx]) or ""
+                # Use language-specific OCR
+                txt = pytesseract.image_to_string(images[idx], lang=ocr_lang) or ""
                 out[idx] = _clean_text(txt)
-            except Exception:
-                pass
+            except Exception as e:
+                # Fallback to English if language-specific OCR fails
+                try:
+                    txt = pytesseract.image_to_string(images[idx], lang='eng') or ""
+                    out[idx] = _clean_text(txt)
+                except Exception:
+                    pass
     return out
 
 # -----------------------------
@@ -170,14 +241,32 @@ def extract_pdf_pages(path: str):
                     "table_img": None,
                 })
 
-    # Optional OCR for nearly-empty pages
+    # Detect language for this PDF (if auto-detect enabled)
+    detected_language = 'en'  # Default
+    if AUTO_DETECT_LANGUAGE:
+        try:
+            from .language_detection import detect_pdf_language
+            detected_language = detect_pdf_language(path, sample_pages=3)
+            print(f"[language_detection] Detected language for {doc_name}: {detected_language}")
+        except Exception as e:
+            print(f"[language_detection] Language detection failed: {e}, defaulting to English")
+    
+    # Optional OCR for nearly-empty pages (with language support)
     ocr_targets = sorted({
         rp["page_number"] - 1
         for rp in result_pages
         if len((rp.get("text") or "").strip()) < 20 and isinstance(rp.get("page_number"), int)
     })
     if ocr_targets:
-        ocr_map = _ocr_pages_if_needed(path, ocr_targets)  # {0-based: text}
+        # Determine OCR language based on detected language
+        ocr_lang = None
+        if detected_language == 'vi':
+            ocr_lang = 'vie'
+        elif detected_language == 'mixed':
+            ocr_lang = 'vie+eng'
+        # else: use default (eng)
+        
+        ocr_map = _ocr_pages_if_needed(path, ocr_targets, language=ocr_lang)
         if ocr_map:
             # Apply OCR text to the last entry we emitted for each page_number.
             last_idx_by_page: Dict[int, int] = {}
@@ -190,13 +279,18 @@ def extract_pdf_pages(path: str):
                 doc_idx = last_idx_by_page.get(pn)
                 if doc_idx is not None:
                     result_pages[doc_idx]["text"] = _clean_text(ocr_text)
+    
+    # Add language metadata to each page
+    for rp in result_pages:
+        rp["language"] = detected_language
 
-    # Yield with stable keys
+    # Yield with stable keys (including language)
     for p in result_pages:
         yield {
             "doc": p.get("doc", doc_name),
             "text": p.get("text", ""),
             "page_number": p.get("page_number"),
+            "language": p.get("language", "en"),  # NEW: Language metadata
             "is_table": False,
             "table_html": "",
             "table_md": "",
@@ -232,31 +326,56 @@ def chunk_pages_dual(pages, big_size=1600, small_size=600, overlap=60):
     small_chunks, small_meta = [], []
 
     for p in pages:
-        text = p.get("text", "") or ""
+        original_text = p.get("text", "") or ""
         page_num = p.get("page_number")
+        language = p.get("language", "en")
+        doc_name = p.get("doc", "")
 
-        # Coarse chunks (sentence-aware)
-        bigs = _split_smart(text, big_size, overlap)
-        for c in bigs:
-            big_meta.append({
-                "doc": p.get("doc", ""),
+        translated_text = _translate_text_if_needed(original_text, language)
+        text_for_chunks = translated_text or original_text
+
+        # Prepare aligned original chunks if we translated
+        original_big_chunks = _split_smart(original_text, big_size, overlap) if translated_text else None
+        original_small_chunks = _split_smart(original_text, small_size, overlap) if translated_text else None
+
+        bigs = _split_smart(text_for_chunks, big_size, overlap)
+        for idx, c in enumerate(bigs):
+            orig_chunk = original_big_chunks[idx] if translated_text and original_big_chunks and idx < len(original_big_chunks) else (original_text if not translated_text else "")
+            meta = {
+                "doc": doc_name,
                 "page": page_num,
+                "language": language,
                 "fact_score": compute_fact_score(c),
                 "subjective": is_subjective(c),
                 "is_table": False,
-            })
+            }
+            if translated_text:
+                meta.update({
+                    "original_text": _clip_text(orig_chunk, 800),
+                    "translated_text": c,
+                    "translated": True,
+                })
+            big_meta.append(meta)
             big_chunks.append(c)
 
-        # Fine-grained sliding
-        smalls = _split_smart(text, small_size, overlap)
-        for c in smalls:
-            small_meta.append({
-                "doc": p.get("doc", ""),
+        smalls = _split_smart(text_for_chunks, small_size, overlap)
+        for idx, c in enumerate(smalls):
+            orig_chunk = original_small_chunks[idx] if translated_text and original_small_chunks and idx < len(original_small_chunks) else (original_text if not translated_text else "")
+            meta = {
+                "doc": doc_name,
                 "page": page_num,
+                "language": language,
                 "fact_score": compute_fact_score(c),
                 "subjective": is_subjective(c),
                 "is_table": False,
-            })
+            }
+            if translated_text:
+                meta.update({
+                    "original_text": _clip_text(orig_chunk, 400),
+                    "translated_text": c,
+                    "translated": True,
+                })
+            small_meta.append(meta)
             small_chunks.append(c)
 
     return (big_chunks, big_meta), (small_chunks, small_meta)
@@ -306,7 +425,13 @@ class _STEncoder:
         from sentence_transformers import SentenceTransformer
         self.model = SentenceTransformer(model_name)
         self.dim = self.model.get_sentence_embedding_dimension()
-    def encode(self, texts: List[str]) -> np.ndarray:
+        # E5 models work better with prefixes (optional but recommended)
+        self.is_e5_model = "e5" in model_name.lower() or "multilingual-e5" in model_name.lower()
+    def encode(self, texts: List[str], is_query: bool = False) -> np.ndarray:
+        # E5 models: prepend "query: " for queries, "passage: " for documents
+        if self.is_e5_model:
+            prefix = "query: " if is_query else "passage: "
+            texts = [prefix + text if text and not text.startswith(prefix) else text for text in texts]
         embs = self.model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
         return np.asarray(embs, dtype="float32")
 
@@ -489,7 +614,11 @@ class VectorStore:
         np.save(self.text_path, np.array(self.texts, dtype=object), allow_pickle=True)
 
     # ---------- encode ----------
-    def _encode(self, texts: List[str]) -> np.ndarray:
+    def _encode(self, texts: List[str], is_query: bool = False) -> np.ndarray:
+        # Pass is_query flag to encoder (for E5 models)
+        if hasattr(self.encoder, 'encode'):
+            if hasattr(self.encoder, 'is_e5_model') and self.encoder.is_e5_model:
+                return self.encoder.encode(texts, is_query=is_query)
         return self.encoder.encode(texts)
 
     # ---------- add ----------
@@ -521,7 +650,7 @@ class VectorStore:
                 embs = self._encode(self.texts)
                 self.index.add(embs)
                 self._save()
-        q = self._encode([query])
+        q = self._encode([query], is_query=True)  # NEW: Mark as query for E5 models
         try:
             D, I = self.index.search(q, k)
         except Exception:
@@ -585,7 +714,7 @@ class VectorStore:
         for qx in queries:
             # Dense cosine (inner product of normalized embs)
             try:
-                qv = self._encode([qx])  # shape (1, dim)
+                qv = self._encode([qx], is_query=True)  # NEW: Mark as query for E5 models
                 D, I = self.index.search(qv, max(1, pre_k // 2))
                 for idx, score in zip(I[0], D[0]):
                     if 0 <= idx < n and idx not in seen:

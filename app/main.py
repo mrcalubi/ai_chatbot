@@ -41,7 +41,7 @@ def _cached_search(query: str, alpha: float, use_ce: bool, pre_k: int, mmr_topn:
 # ---------------- Env ----------------
 load_dotenv()
 
-EMBED_MODEL = os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+EMBED_MODEL = os.getenv("EMBED_MODEL", "intfloat/multilingual-e5-base")
 TOP_K = int(os.getenv("TOP_K", "6"))
 MODEL = os.getenv("MODEL", "gpt-4o-mini")
 
@@ -423,12 +423,22 @@ def _build_context_and_cites(hits: List[Tuple[str, dict, float]]):
     for text, meta, _ in hits:
         doc = (meta or {}).get("doc", "UnknownDoc")
         page = (meta or {}).get("page")
+        language = (meta or {}).get("language", "en")  # NEW: Get language from metadata
         key = (doc, page)
         if key in seen: continue
         seen.add(key)
-        snippet = (text or "")[:1200]
+        raw_translated = (meta or {}).get("translated_text") or (text or "")
+        raw_original = (meta or {}).get("original_text")
+        snippet = raw_translated[:1200]
         context_blocks.append(f"[Document: {doc}, Page: {page}]\n{snippet}")
-        cites.append(Citation(doc=doc, page=page, snippet=_truncate_at_word_boundary(snippet, 280)))
+        cites.append(Citation(
+            doc=doc, 
+            page=page, 
+            snippet=_truncate_at_word_boundary(snippet, 280),
+            language=language,
+            original_text=raw_original,
+            translated_text=_truncate_at_word_boundary(raw_translated, 320) if raw_translated else None
+        ))
     return context_blocks, cites
 
 def _indexed_docs() -> List[str]:
@@ -595,12 +605,35 @@ def _detect_doc_scope_from_query(query: str) -> List[str]:
     # 1. Stock tickers/codes (2-10 uppercase letters)
     tickers = set(re.findall(r'\b([A-Z]{2,10})\b', query))
     
-    # 2. Capitalized words (proper nouns like "Viglacera", "Berkshire", "Metrobrands")
-    proper_nouns = set(re.findall(r'\b([A-Z][a-z]{2,15})\b', query))
+    # 2. Capitalized words (proper nouns like "Viglacera", "Berkshire", "Metrobrands", "DailyVN")
+    proper_nouns = set(re.findall(r'\b([A-Z][a-z]{0,15}[A-Z]?[a-z]{0,15})\b', query))  # Allow mixed case like "DailyVN"
     
-    # 3. Longer lowercase tokens (7+ chars) that might be company names
-    # This catches "metrobrands", "viglacera", "ducgiang" etc.
-    long_lowercase_tokens = set(re.findall(r'\b([a-z]{7,15})\b', query_lower))
+    # 3. Longer lowercase tokens (5+ chars) that might be company names or document identifiers
+    # Reduced from 7+ to 5+ to catch "daily", "vnindex", etc.
+    long_lowercase_tokens = set(re.findall(r'\b([a-z]{5,20})\b', query_lower))
+    
+    # 4. NEW: Extract word pairs that might form company/document names (e.g., "vn index" -> "vnindex")
+    # This helps match queries like "vn index" to filenames like "DailyVN.pdf"
+    word_pairs = set()
+    words = query_lower.split()
+    for i in range(len(words) - 1):
+        pair = words[i] + words[i+1]  # e.g., "vnindex" from "vn index"
+        if len(pair) >= 5 and pair not in COMMON_WORDS:
+            word_pairs.add(pair)
+    long_lowercase_tokens.update(word_pairs)
+    
+    # 5. NEW: Check if query contains terms that appear in any filename (reverse lookup)
+    # This helps match "vn index" to "20251106DailyVN.pdf" by checking if "vn" or "daily" appears in filenames
+    filename_keywords = set()
+    for doc in docs:
+        doc_lower = doc.lower()
+        # Extract meaningful parts from filename (skip dates, numbers)
+        doc_words = re.findall(r'[a-z]{3,}', doc_lower)  # Words with 3+ lowercase letters
+        for word in doc_words:
+            # If this word from filename appears in query, it's a potential match
+            if word in query_lower and word not in COMMON_WORDS and len(word) >= 3:
+                filename_keywords.add(word.upper())
+    long_lowercase_tokens.update(filename_keywords)
     
     # 4. Normalize company names using aliases
     normalized_tickers = set()
@@ -644,11 +677,18 @@ def _detect_doc_scope_from_query(query: str) -> List[str]:
         doc_lower = doc.lower()
         doc_upper = doc.upper()
         doc_base = os.path.splitext(doc)[0]  # Remove .pdf extension
+        doc_base_lower = doc_base.lower()
         
         score = 0
         for candidate in all_candidates:
             cand_lower = candidate.lower()
             cand_upper = candidate.upper()
+            
+            # NEW: Check if candidate appears as substring in filename (before other checks)
+            # This helps match "vn" in "DailyVN" or "dailyvn" in query matching "20251106DailyVN.pdf"
+            # Do this first to catch substring matches before more specific checks
+            if cand_lower in doc_base_lower or cand_upper in doc_base or doc_base_lower in cand_lower:
+                score += 75  # Higher score for substring match (helps with Vietnamese PDFs)
             
             # Prioritize exact company code matches (e.g., "METROBRA" in "METROBRA 2025...")
             if doc_upper.startswith(cand_upper + " ") or doc_upper.startswith(cand_upper + "_"):
@@ -687,39 +727,75 @@ def _detect_doc_scope_from_query(query: str) -> List[str]:
     if not doc_scores:
         return []
     
-    # Sort by score and return only high-confidence matches
+    # Sort by score and return only VERY high-confidence matches
+    # Only use scope filtering when we're VERY confident (exact company code match)
+    # Otherwise, let semantic search find relevant documents based on content
     sorted_docs = sorted(doc_scores.items(), key=lambda x: x[1], reverse=True)
     
-    # Return documents with score >= 100 (strong match threshold)
-    # This ensures we only return documents that have clear company code matches
-    strong_matches = [doc for doc, score in sorted_docs if score >= 100]
+    # VERY high confidence threshold (exact company code match like "METROBRA" at start)
+    # Only filter when score >= 200 (exact company code prefix match)
+    very_strong_matches = [doc for doc, score in sorted_docs if score >= 200]
     
-    if strong_matches:
-        print(f"[scope_detection] ✅ Strong matches ({len(strong_matches)}): {strong_matches[:5]}")
-        return strong_matches[:10]  # Limit to top 10 to avoid performance issues
+    if very_strong_matches:
+        print(f"[scope_detection] ✅ Very strong matches ({len(very_strong_matches)}): {very_strong_matches[:5]}")
+        return very_strong_matches[:10]  # Limit to top 10 to avoid performance issues
     
-    # If no strong matches (score >= 100), but we have candidates, return top 3
-    # This handles edge cases but with lower confidence
-    if sorted_docs and sorted_docs[0][1] >= 50:
-        top_docs = [doc for doc, _ in sorted_docs[:3]]
-        print(f"[scope_detection] ⚠️  Moderate matches (score < 100): {top_docs}")
-        return top_docs
-    
-    # No matches found
-    print(f"[scope_detection] ❌ No matches found for candidates: {all_candidates}")
-    return []
+    # For weaker matches, don't filter - let semantic search work
+    # This allows the system to find relevant content even if filename doesn't match
+    top_score = sorted_docs[0][1] if sorted_docs else 0
+    print(f"[scope_detection] ⚠️  No very strong matches (top score: {top_score}) - allowing semantic search to find relevant documents")
+    return []  # Empty scope = no filtering, semantic search works on all documents
 
 def _filter_hits_to_scope(hits: List[Tuple[str, dict, float]], scope_docs: List[str]) -> List[Tuple[str, dict, float]]:
+    """
+    Soft scope filtering: Only filters when scope is VERY confident.
+    Otherwise, uses boosting instead of hard filtering to allow semantic search to work.
+    """
     if not scope_docs:
+        # No scope = no filtering, let semantic search find all relevant documents
         return hits
-    scope = set(scope_docs)
-    filtered = [h for h in hits if (h[1] or {}).get("doc") in scope]
     
-    # Safety filter: If scope contains company-specific docs (VGC, DGC, METROBRA),
-    # remove Warren Buffett documents even if they somehow passed through
+    scope = set(scope_docs)
+    
+    # NEW APPROACH: Soft filtering with boosting
+    # Instead of hard filtering, we boost scope-matched documents
+    # But still allow non-scope documents if they're highly relevant semantically
+    
+    scope_hits = []
+    non_scope_hits = []
+    
+    for h in hits:
+        doc = (h[1] or {}).get("doc", "")
+        if doc in scope:
+            scope_hits.append(h)
+        else:
+            non_scope_hits.append(h)
+    
+    # If we have scope matches, prioritize them but don't completely exclude others
+    # Only do hard filtering if we have MANY scope hits (meaning scope is working well)
+    if len(scope_hits) >= 3:
+        # Strong scope signal - filter to scope only
+        filtered = scope_hits
+        print(f"[scope_filter] Strong scope signal ({len(scope_hits)} scope hits) - filtering to scope documents only")
+    elif len(scope_hits) > 0:
+        # Weak scope signal - keep scope hits first, but allow top non-scope hits too
+        # This allows semantic search to find relevant content even if filename doesn't match
+        # Keep top-scoring non-scope hits (up to 30% of total)
+        max_non_scope = max(1, int(len(scope_hits) * 0.3))
+        top_non_scope = sorted(non_scope_hits, key=lambda x: x[2], reverse=True)[:max_non_scope]
+        filtered = scope_hits + top_non_scope
+        print(f"[scope_filter] Weak scope signal ({len(scope_hits)} scope hits) - keeping {len(top_non_scope)} top non-scope hits for semantic relevance")
+    else:
+        # No scope hits at all - don't filter, let semantic search work
+        filtered = hits
+        print(f"[scope_filter] No scope hits found - allowing all documents (semantic search will find relevant content)")
+    
+    # Safety filter: Remove Warren Buffett docs if scope is company-specific
     if scope_docs and any(company in ''.join(scope_docs).upper() for company in ['VGC', 'DGC', 'METROBRA']):
+        before_safety = len(filtered)
         filtered = [h for h in filtered if 'Warren' not in (h[1] or {}).get("doc", "") and 'Buffett' not in (h[1] or {}).get("doc", "")]
-        print(f"[scope_filter] Applied safety filter to remove Warren Buffett docs")
+        if len(filtered) < before_safety:
+            print(f"[scope_filter] Applied safety filter to remove Warren Buffett docs")
     
     return filtered
 
@@ -853,18 +929,29 @@ async def chat(req: ChatRequest):
                     print(f"[scope_filter] No overlap between scopes, using current query scope")
     
     # FALLBACK: If still no scope, check last 10 questions for ANY company mentions
+    # BUT only if current query doesn't have clear document-specific hints (like "vn", "daily", "index")
     if not scope_docs:
-        print(f"[scope_filter] No scope yet, checking recent conversation history...")
-        recent_qs = [item.get("q", "") for item in reversed(_QA_CACHE[-10:]) if isinstance(item, dict) and item.get("q")]
-        for idx, recent_q in enumerate(recent_qs):
-            recent_scope = _detect_doc_scope_from_query(recent_q)
-            if recent_scope:
-                scope_docs = recent_scope
-                print(f"[scope_filter] ✅ Found scope in recent Q-{idx}: '{recent_q[:50]}...' → {scope_docs}")
-                break
+        # Check if query has document-specific terms that suggest it's about a specific PDF
+        query_has_doc_hints = bool(
+            re.search(r'\b(vn|daily|index|vietnam|viet|dailyn)\b', req.query.lower(), re.I) or
+            any(word in req.query.lower() for word in ['pdf', 'document', 'file', 'report']) or
+            any(doc_keyword in req.query.lower() for doc_keyword in ['vnindex', 'vn index', 'daily vn'])
+        )
+        
+        if not query_has_doc_hints:
+            print(f"[scope_filter] No scope yet, checking recent conversation history...")
+            recent_qs = [item.get("q", "") for item in reversed(_QA_CACHE[-10:]) if isinstance(item, dict) and item.get("q")]
+            for idx, recent_q in enumerate(recent_qs):
+                recent_scope = _detect_doc_scope_from_query(recent_q)
+                if recent_scope:
+                    scope_docs = recent_scope
+                    print(f"[scope_filter] ✅ Found scope in recent Q-{idx}: '{recent_q[:50]}...' → {scope_docs}")
+                    break
+        else:
+            print(f"[scope_filter] Query has document hints (vn/daily/index) - skipping history scope to avoid false filtering")
         
         if not scope_docs:
-            print(f"[scope_filter] ⚠️  No scope found in recent history")
+            print(f"[scope_filter] ⚠️  No scope found - will search all documents")
 
     # --- Retrieval: expand queries (HyDE+CE), include follow-up rollovers ---
     subqs = expand_query(req.query)
@@ -938,14 +1025,24 @@ async def chat(req: ChatRequest):
                 text, meta = item
             doc = (meta or {}).get("doc", "UnknownDoc")
             page = (meta or {}).get("page")
-            snippet = (text or "")[:1200]
+            language = (meta or {}).get("language", "en")  # NEW: Get language from metadata
+            raw_translated = (meta or {}).get("translated_text") or (text or "")
+            raw_original = (meta or {}).get("original_text")
+            snippet = raw_translated[:1200]
             if snippet.strip():  # Only add non-empty snippets
                 context_blocks.append(f"[Document: {doc}, Page: {page}]\n{snippet}")
-                cites.append(Citation(doc=doc, page=page, snippet=_truncate_at_word_boundary(snippet, 280)))
+                cites.append(Citation(
+                    doc=doc, 
+                    page=page, 
+                    snippet=_truncate_at_word_boundary(snippet, 280),
+                    language=language,
+                    original_text=raw_original,
+                    translated_text=_truncate_at_word_boundary(raw_translated, 320) if raw_translated else None
+                ))
 
         if not context_blocks:
             try:
-                q_vec = store._encode([req.query])[0]
+                q_vec = store._encode([req.query], is_query=True)[0]  # NEW: Mark as query for E5 models
             except Exception:
                 q_vec = None
             _qa_log_append(req.query, [], q_vec)
@@ -1028,13 +1125,19 @@ async def chat(req: ChatRequest):
     for text, meta, _ in hits_all:
         doc = (meta or {}).get("doc", "UnknownDoc")
         page = (meta or {}).get("page")
+        language = (meta or {}).get("language", "en")  # NEW: Get language from metadata
         key = (doc, page)
         if key in seen_pages:
             continue
         seen_pages.add(key)
         snippet = (text or "")[:1200]
         context_blocks.append(f"[Document: {doc}, Page: {page}]\n{snippet}")
-        cites.append(Citation(doc=doc, page=page, snippet=_truncate_at_word_boundary(snippet, 280)))
+        cites.append(Citation(
+            doc=doc, 
+            page=page, 
+            snippet=_truncate_at_word_boundary(snippet, 280),
+            language=language  # NEW: Include language in citation
+        ))
 
     context_str = "\n\n---\n\n".join(context_blocks) if context_blocks else "(no matching excerpts)"
     guardrails = (
@@ -1133,18 +1236,29 @@ async def chat_stream(req: ChatRequest):
                     print(f"[scope_filter] No overlap between scopes, using current query scope")
     
     # FALLBACK: If still no scope, check last 10 questions for ANY company mentions
+    # BUT only if current query doesn't have clear document-specific hints (like "vn", "daily", "index")
     if not scope_docs:
-        print(f"[scope_filter] No scope yet, checking recent conversation history...")
-        recent_qs = [item.get("q", "") for item in reversed(_QA_CACHE[-10:]) if isinstance(item, dict) and item.get("q")]
-        for idx, recent_q in enumerate(recent_qs):
-            recent_scope = _detect_doc_scope_from_query(recent_q)
-            if recent_scope:
-                scope_docs = recent_scope
-                print(f"[scope_filter] ✅ Found scope in recent Q-{idx}: '{recent_q[:50]}...' → {scope_docs}")
-                break
+        # Check if query has document-specific terms that suggest it's about a specific PDF
+        query_has_doc_hints = bool(
+            re.search(r'\b(vn|daily|index|vietnam|viet|dailyn)\b', req.query.lower(), re.I) or
+            any(word in req.query.lower() for word in ['pdf', 'document', 'file', 'report']) or
+            any(doc_keyword in req.query.lower() for doc_keyword in ['vnindex', 'vn index', 'daily vn'])
+        )
+        
+        if not query_has_doc_hints:
+            print(f"[scope_filter] No scope yet, checking recent conversation history...")
+            recent_qs = [item.get("q", "") for item in reversed(_QA_CACHE[-10:]) if isinstance(item, dict) and item.get("q")]
+            for idx, recent_q in enumerate(recent_qs):
+                recent_scope = _detect_doc_scope_from_query(recent_q)
+                if recent_scope:
+                    scope_docs = recent_scope
+                    print(f"[scope_filter] ✅ Found scope in recent Q-{idx}: '{recent_q[:50]}...' → {scope_docs}")
+                    break
+        else:
+            print(f"[scope_filter] Query has document hints (vn/daily/index) - skipping history scope to avoid false filtering")
         
         if not scope_docs:
-            print(f"[scope_filter] ⚠️  No scope found in recent history")
+            print(f"[scope_filter] ⚠️  No scope found - will search all documents")
 
     import time  # top of file once is fine
     t0 = time.time()
@@ -1192,7 +1306,8 @@ async def chat_stream(req: ChatRequest):
     # 3) Soft scope filter AFTER merge to avoid wiping candidates
     merged = primary_hits + numeric_hits
     
-    # Scope filter (to avoid cross-company leakage)
+    # Scope filter (soft filtering - only when very confident)
+    # Otherwise, let semantic search find relevant documents based on content
     if scope_docs:
         before_count = len(merged)
         before_docs = set((h[1] or {}).get("doc") for h in merged if h[1])
@@ -1203,11 +1318,12 @@ async def chat_stream(req: ChatRequest):
         after_count = len(merged)
         after_docs = set((h[1] or {}).get("doc") for h in merged if h[1])
         print(f"[scope_filter] After filter - {after_count} hits from docs: {sorted(after_docs)[:5]}")
-        print(f"[scope_filter] Filtered hits: {before_count} → {after_count} (removed {before_count - after_count})")
+        if before_count != after_count:
+            print(f"[scope_filter] Filtered hits: {before_count} → {after_count} (removed {before_count - after_count})")
     else:
-        print(f"[scope_filter] WARNING: No scope detected, not filtering hits (total: {len(merged)})")
+        print(f"[scope_filter] No scope detected - allowing semantic search to find relevant documents from all PDFs")
         hit_docs = set((h[1] or {}).get("doc") for h in merged if h[1])
-        print(f"[scope_filter] Unfiltered docs: {sorted(hit_docs)[:10]}")
+        print(f"[scope_filter] Searching across {len(hit_docs)} documents: {sorted(hit_docs)[:10]}")
 
     # --- One-shot hybrid booster (fires ONLY if BM25+numeric looks weak) ---
     if _needs_hybrid_boost(merged, min_numeric=3, min_total=max(8, (k or 8))):

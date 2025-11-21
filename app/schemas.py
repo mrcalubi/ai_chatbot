@@ -5,6 +5,9 @@ class Citation(BaseModel):
     doc: str
     page: Optional[int] = None
     snippet: Optional[str] = None
+    language: Optional[str] = None  # NEW: Language of source document ('vi', 'en', 'mixed')
+    original_text: Optional[str] = None  # NEW: Original text (for Vietnamese PDFs)
+    translated_text: Optional[str] = None  # NEW: Translated text (for Vietnamese PDFs)
 
 class ChatRequest(BaseModel):
     query: str

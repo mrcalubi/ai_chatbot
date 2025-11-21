@@ -35,5 +35,6 @@ echo ""
 echo "Press Ctrl+C to stop the server"
 echo ""
 
-uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+# Run without --reload to avoid macOS permission issues with file watching
+uvicorn app.main:app --host 127.0.0.1 --port 8000
 
