@@ -28,10 +28,13 @@ from .tables import detect_tables_text_only
 # Config (via environment)
 # -----------------------------
 EMBED_MODEL = os.getenv("EMBED_MODEL", "intfloat/multilingual-e5-base")
-OCR_ENABLED = (os.getenv("OCR_ENABLED", "false").lower() == "true")
-OCR_DPI = int(os.getenv("OCR_DPI", "220"))
+# OCR enabled by default for Vietnamese/mixed PDFs, can be disabled with OCR_ENABLED=false
+OCR_ENABLED = os.getenv("OCR_ENABLED", "").lower() != "false"  # Default: true (enabled)
+OCR_DPI = int(os.getenv("OCR_DPI", "300"))  # Increased from 220 for better quality
 OCR_LANGUAGE = os.getenv("OCR_LANGUAGE", "eng")  # Options: 'eng', 'vie', 'vie+eng'
 AUTO_DETECT_LANGUAGE = (os.getenv("AUTO_DETECT_LANGUAGE", "true").lower() == "true")
+# Threshold for detecting scanned pages: if text density is low, likely scanned
+OCR_TEXT_THRESHOLD = int(os.getenv("OCR_TEXT_THRESHOLD", "100"))  # Characters per page
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 TRANSLATION_ENABLED = (os.getenv("TRANSLATION_ENABLED", "true").lower() == "true")
 TRANSLATION_SOURCE_LANGS = {lang.strip().lower() for lang in os.getenv("TRANSLATION_SOURCE_LANGS", "vi").split(',') if lang.strip()}
@@ -133,7 +136,7 @@ def _translate_text_if_needed(text: str, language: str) -> Optional[str]:
 # -----------------------------
 # Optional OCR (best-effort) with language support
 # -----------------------------
-def _ocr_pages_if_needed(path: str, page_idxs_needing_ocr: List[int], language: str = None) -> Dict[int, str]:
+def _ocr_pages_if_needed(path: str, page_idxs_needing_ocr: List[int], language: str = None, doc_name: str = None) -> Dict[int, str]:
     """
     OCR pages with language support (English or Vietnamese).
     
@@ -146,13 +149,19 @@ def _ocr_pages_if_needed(path: str, page_idxs_needing_ocr: List[int], language: 
         Dictionary mapping page index to OCR text
     """
     out: Dict[int, str] = {}
-    if not OCR_ENABLED or not page_idxs_needing_ocr:
+    if not OCR_ENABLED:
+        print(f"[OCR] OCR disabled (OCR_ENABLED={OCR_ENABLED})")
+        return out
+    if not page_idxs_needing_ocr:
+        print(f"[OCR] No pages need OCR")
         return out
     
+    print(f"[OCR] Starting OCR for {len(page_idxs_needing_ocr)} pages...")
     try:
         from pdf2image import convert_from_path
         import pytesseract
-    except Exception:
+    except Exception as e:
+        print(f"[OCR] Failed to import OCR dependencies: {e}")
         return out
 
     # Determine OCR language
@@ -173,22 +182,61 @@ def _ocr_pages_if_needed(path: str, page_idxs_needing_ocr: List[int], language: 
 
     try:
         images = convert_from_path(path, dpi=OCR_DPI)
-    except Exception:
+        print(f"[OCR] Converted {len(images)} pages to images")
+    except Exception as e:
+        print(f"[OCR] Failed to convert PDF to images: {e}")
         return out
 
     for idx in page_idxs_needing_ocr:
         if 0 <= idx < len(images):
             try:
-                # Use language-specific OCR
-                txt = pytesseract.image_to_string(images[idx], lang=ocr_lang) or ""
-                out[idx] = _clean_text(txt)
+                # Improved OCR with better settings for scanned documents
+                # Use PSM mode 6 (uniform block of text) for better table detection
+                # Use PSM mode 3 (fully automatic) as fallback
+                ocr_configs = [
+                    f'--psm 6 -l {ocr_lang}',  # Uniform block (good for tables)
+                    f'--psm 3 -l {ocr_lang}',  # Fully automatic
+                    f'--psm 6 -l eng',  # Fallback to English
+                ]
+                
+                txt = ""
+                last_error = None
+                for config in ocr_configs:
+                    try:
+                        txt = pytesseract.image_to_string(images[idx], config=config) or ""
+                        if len(txt.strip()) > 50:  # If we got substantial text, use it
+                            break
+                    except Exception as e:
+                        last_error = e
+                        continue
+                
+                if txt and len(txt.strip()) > 10:
+                    cleaned = _clean_text(txt)
+                    out[idx] = cleaned
+                    print(f"[OCR] Page {idx+1}: extracted {len(txt)} chars with lang={ocr_lang}")
+                    # Debug: Show OCR text for page 4 of HAH (ship table)
+                    if idx == 3 and doc_name and 'HAH' in doc_name.upper():  # Page 4 (0-based index 3) of HAH
+                        preview = cleaned[:500].replace('\n', ' ').strip()
+                        print(f"[OCR] HAH Page 4 preview (first 500 chars): {preview}...")
+                        # Also check if ship names are present
+                        ship_keywords = ['haian', 'gama', 'mind', 'link', 'west', 'east', 'view', 'park', 'time', 'bell', 'rose', 'city', 'alfa', 'beta', 'opus', 'charlie']
+                        found_ships = [kw for kw in ship_keywords if kw.lower() in cleaned.lower()]
+                        if found_ships:
+                            print(f"[OCR] HAH Page 4: Found ship keywords: {found_ships}")
+                        else:
+                            print(f"[OCR] HAH Page 4: WARNING - No ship keywords found in OCR text!")
+                elif last_error:
+                    print(f"[OCR] Page {idx+1}: All OCR configs failed, last error: {last_error}")
             except Exception as e:
-                # Fallback to English if language-specific OCR fails
+                print(f"[OCR] Failed on page {idx+1}: {e}")
+                # Final fallback to English (no PSM mode)
                 try:
                     txt = pytesseract.image_to_string(images[idx], lang='eng') or ""
-                    out[idx] = _clean_text(txt)
-                except Exception:
-                    pass
+                    if txt and len(txt.strip()) > 10:
+                        out[idx] = _clean_text(txt)
+                        print(f"[OCR] Page {idx+1}: fallback extracted {len(txt)} chars")
+                except Exception as e2:
+                    print(f"[OCR] Page {idx+1}: fallback also failed: {e2}")
     return out
 
 # -----------------------------
@@ -223,14 +271,24 @@ def extract_pdf_pages(path: str):
 
     # Extract text with PyMuPDF for retrieval context
     with fitz.open(path) as doc:
+        total_pages = doc.page_count
+        print(f"[extract_pdf_pages] Processing {total_pages} pages from {doc_name}")
+        page_images_count = []  # Track image count per page for scanned detection
         for i, page in enumerate(doc, start=1):
             blocks = page.get_text("blocks") or []
             text_blocks = [b for b in blocks if len(b) >= 5 and isinstance(b[4], str)]
             raw_text = " ".join(_clean_text(b[4]) for b in text_blocks if b[4])
             drawings = page.get_drawings() or []
+            
+            # Count images on page (indicator of scanned content)
+            image_list = page.get_images()
+            image_count = len(image_list) if image_list else 0
+            text_len = len(raw_text.strip())
+            page_images_count.append((i, image_count, text_len))
 
             # Always emit a normal page text chunk for retrieval unless clearly chart-only
-            if not _is_likely_graph(drawings):
+            is_graph = _is_likely_graph(drawings)
+            if not is_graph:
                 result_pages.append({
                     "doc": doc_name,
                     "text": _clean_text(raw_text),
@@ -240,6 +298,10 @@ def extract_pdf_pages(path: str):
                     "table_md": "",
                     "table_img": None,
                 })
+            else:
+                print(f"[extract_pdf_pages] Page {i} skipped (likely graph/chart)")
+        
+        print(f"[extract_pdf_pages] Extracted {len(result_pages)} pages from {doc_name}")
 
     # Detect language for this PDF (if auto-detect enabled)
     detected_language = 'en'  # Default
@@ -251,12 +313,40 @@ def extract_pdf_pages(path: str):
         except Exception as e:
             print(f"[language_detection] Language detection failed: {e}, defaulting to English")
     
-    # Optional OCR for nearly-empty pages (with language support)
-    ocr_targets = sorted({
-        rp["page_number"] - 1
-        for rp in result_pages
-        if len((rp.get("text") or "").strip()) < 20 and isinstance(rp.get("page_number"), int)
-    })
+    # Improved OCR detection: pages with little text OR pages with images but low text density
+    # This catches scanned PDFs that might have headers/footers but scanned body content
+    ocr_targets = set()
+    print(f"[OCR] Checking {len(page_images_count)} pages for OCR. OCR_ENABLED={OCR_ENABLED}, detected_language={detected_language}")
+    
+    # For Vietnamese/mixed PDFs, be VERY aggressive - OCR all pages with images OR low text
+    # Many Vietnamese reports are fully scanned, so we need to OCR most pages
+    is_vn_pdf = detected_language in ('vi', 'mixed')
+    
+    for page_num, image_count, text_len in page_images_count:
+        page_idx = page_num - 1
+        # Trigger OCR if:
+        # 1. Very little text (< 20 chars) - always OCR
+        # 2. Has images AND low text density - scanned page detection
+        # 3. For Vietnamese/mixed PDFs: OCR if has images OR text < 200 chars (very aggressive)
+        should_ocr = False
+        if text_len < 20:
+            should_ocr = True  # Always OCR nearly-empty pages
+        elif is_vn_pdf:
+            # For VN PDFs: OCR if has images OR text is low (likely scanned)
+            if image_count > 0 or text_len < 200:
+                should_ocr = True
+        else:
+            # For English PDFs: OCR if has images AND text is low
+            threshold = OCR_TEXT_THRESHOLD
+            if image_count > 0 and text_len < threshold:
+                should_ocr = True
+        
+        if should_ocr:
+            ocr_targets.add(page_idx)
+            print(f"[OCR] Page {page_num} flagged: text_len={text_len}, images={image_count}, is_vn={is_vn_pdf}")
+    
+    ocr_targets = sorted(ocr_targets)
+    print(f"[OCR] Total pages to OCR: {len(ocr_targets)} out of {len(page_images_count)}")
     if ocr_targets:
         # Determine OCR language based on detected language
         ocr_lang = None
@@ -266,7 +356,8 @@ def extract_pdf_pages(path: str):
             ocr_lang = 'vie+eng'
         # else: use default (eng)
         
-        ocr_map = _ocr_pages_if_needed(path, ocr_targets, language=ocr_lang)
+        ocr_map = _ocr_pages_if_needed(path, ocr_targets, language=ocr_lang, doc_name=doc_name)
+        print(f"[OCR] OCR completed, got results for {len(ocr_map)} pages")
         if ocr_map:
             # Apply OCR text to the last entry we emitted for each page_number.
             last_idx_by_page: Dict[int, int] = {}
@@ -274,11 +365,16 @@ def extract_pdf_pages(path: str):
                 pn = rp.get("page_number")
                 if isinstance(pn, int):
                     last_idx_by_page[pn] = idx
+            applied_count = 0
             for zero_based_idx, ocr_text in ocr_map.items():
                 pn = zero_based_idx + 1
                 doc_idx = last_idx_by_page.get(pn)
                 if doc_idx is not None:
                     result_pages[doc_idx]["text"] = _clean_text(ocr_text)
+                    applied_count += 1
+            print(f"[OCR] Applied OCR text to {applied_count} pages")
+        else:
+            print(f"[OCR] WARNING: No OCR results returned for {len(ocr_targets)} flagged pages")
     
     # Add language metadata to each page
     for rp in result_pages:

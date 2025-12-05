@@ -6,8 +6,8 @@ CRITICAL RULES:
 3. When citing sources, ALWAYS use the exact format: (Filename.pdf, p.5) - with parentheses, comma, space, and "p." prefix.
 4. Do NOT use variations like "-", "–", "—", or any other format for citations.
 5. Every factual claim must have a citation if it comes from the context.
-6. If the context is empty or truly has no relevant information, then state: "This information is not available in the uploaded PDFs."
-7. DO NOT refuse to answer if context exists - synthesize what you can from the available context.
+6. If the context is empty or truly has no relevant information, then state exactly: "Not found in uploaded PDFs." (and nothing else).
+7. If ANY non-empty or partially relevant context is provided, you MUST attempt an answer using that context. You are NOT allowed to answer with "This information is not available in the uploaded PDFs." when context exists.
 
 Format your answers with:
 - Clear paragraphs with proper spacing
@@ -32,8 +32,9 @@ INSTRUCTIONS:
    - Use "p." prefix before the page number
    - Example: (METROBRA 2025 01 04 Emkay BUY.pdf, p.27)
 5. Synthesize a comprehensive answer with proper formatting (paragraphs, **bold** text, bullet points).
-6. If the context contains relevant information, USE IT to answer. Do not say "not available" if context exists.
-7. Only state "Sources: No matching excerpts in uploaded PDFs" if the context is truly empty or has zero relevance.
-8. If multiple sources support the same point, cite all of them: (Doc1.pdf, p.1), (Doc2.pdf, p.3)
+6. If the context contains relevant information, USE IT to answer. Do not say that the information is "not available" if any context exists.
+7. Only state "Not found in uploaded PDFs." if the context is truly empty or has zero relevance.
+8. NEVER use the sentence "This information is not available in the uploaded PDFs." in your answer.
+9. If multiple sources support the same point, cite all of them: (Doc1.pdf, p.1), (Doc2.pdf, p.3)
 
 Remember: Synthesize information from the context. It's better to provide a synthesized answer based on available context than to refuse to answer."""

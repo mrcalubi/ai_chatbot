@@ -262,12 +262,17 @@
 
     let API;
     if (apiOverride) {
+      // 1) Explicit override via ?api=
       API = apiOverride.replace(/\/+$/, ''); // strip trailing slash
     } else if (isVercel) {
-      // TODO: replace this placeholder with your deployed FastAPI URL
-      // e.g. 'https://mwa-ai-chatbot-api.your-domain.com'
+      // 2) On Vercel, point to your hosted backend (to be set later)
       API = 'https://YOUR-BACKEND-URL-HERE';
+    } else if (/^https?:\/\//.test(location.origin)) {
+      // 3) For anything else served over HTTP(S) (local FastAPI, ngrok, etc),
+      //    use same-origin so the API goes through the same tunnel/host.
+      API = location.origin;
     } else {
+      // 4) Fallback for file:// or unknown origins – assume local dev backend.
       API = 'http://127.0.0.1:8000';
     }
 
