@@ -266,7 +266,7 @@
       API = apiOverride.replace(/\/+$/, ''); // strip trailing slash
     } else if (isVercel) {
       // 2) On Vercel, point to your hosted backend (to be set later)
-      API = 'https://YOUR-BACKEND-URL-HERE';
+      API = 'mwa-chatbot-psi.vercel.app';
     } else if (/^https?:\/\//.test(location.origin)) {
       // 3) For anything else served over HTTP(S) (local FastAPI, ngrok, etc),
       //    use same-origin so the API goes through the same tunnel/host.
@@ -340,7 +340,7 @@
         console.error(e);
         pending.fail(`Request failed: ${e.message}`);
     }finally{
-        $('#ask').disabled=false;
+      $('#ask').disabled = false;
     }
     }
 
