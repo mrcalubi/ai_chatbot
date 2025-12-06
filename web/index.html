@@ -251,38 +251,34 @@
     const now = () => new Date().toLocaleTimeString();
 
 
-    /* ---------- API base ---------- */
+       /* ---------- API base ---------- */
     // Strategy:
     // 1) If ?api=... is present in the URL, use that (handy for testing different backends).
-    // 2) If running on Vercel (hostname ends with vercel.app), point to a hosted FastAPI backend.
-    // 3) Otherwise, default to local dev backend at http://127.0.0.1:8000.
+    // 2) Otherwise, use the same origin as the page (works locally and on Vercel).
     const params = new URLSearchParams(location.search);
     const apiOverride = params.get('api');
-    const isVercel = location.hostname.endsWith('vercel.app');
 
     let API;
     if (apiOverride) {
-      // 1) Explicit override via ?api=
-      API = apiOverride.replace(/\/+$/, ''); // strip trailing slash
-    } else if (isVercel) {
-      // 2) On Vercel, point to your hosted backend (to be set later)
-      API = 'mwa-chatbot-psi.vercel.app';
-    } else if (/^https?:\/\//.test(location.origin)) {
-      // 3) For anything else served over HTTP(S) (local FastAPI, ngrok, etc),
-      //    use same-origin so the API goes through the same tunnel/host.
-      API = location.origin;
+      // Explicit override via ?api=
+      API = apiOverride.trim().replace(/\/+$/, '');   // strip trailing slash
     } else {
-      // 4) Fallback for file:// or unknown origins – assume local dev backend.
-      API = 'http://127.0.0.1:8000';
+      // Same-origin backend: works for Vercel and for local uvicorn
+      API = location.origin.replace(/\/+$/, '');
     }
 
     document.getElementById("apiLabel").textContent = API;
 
-    fetch(API + '/health').then(r=>r.json()).then(()=>{
-      document.getElementById('status').textContent = 'Connected';
-    }).catch(()=>{
-      document.getElementById('status').textContent = `Could not reach API at ${API}. Make sure 'uvicorn app.main:app --reload' is running.`;
-    });
+    fetch(API + '/health')
+      .then(r => r.json())
+      .then(() => {
+        document.getElementById('status').textContent = 'Connected';
+      })
+      .catch(() => {
+        document.getElementById('status').textContent =
+          `Could not reach API at ${API}. Make sure 'uvicorn app.main:app --reload' is running.`;
+      });
+
 
 
 
